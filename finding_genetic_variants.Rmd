@@ -1,0 +1,513 @@
+---
+title: "Finding Genetic Variants with HTS Data"
+author: "Cenk Celik"
+date: "09/09/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Finding Genetic Variants with High-throughput Sequencing Data
+
+To be able to answer where the genetic variants on genome, or how many there are and whether one could classify them, I cover the following techniques:
+
+- To find SNPs and indels in sequencing data using _VariantTools_
+
+- To predict ORF in long reference sequences
+
+- To plot features on genetic maps with _karyoploteR_
+
+- To find alternative transcript isoforms
+
+- To select and classify variants using _VariantAnnotation_
+
+- To extract information in genomic regions of interest
+
+- To find phenotype and genotype associations with GWAS
+
+- To estimate the copy number at a locus of interest
+
+For these, I will need the following packages:
+
+- _Biostrings, GenomicRanges, gmapR, karyoploteR, rtracklayer, systemPipeR, SummarizedExperiment, VariantAnnotation, VariantTools_ from _Bioconductor_
+
+- _rrBLUP_
+
+# Finding SNPs and Indels from Sequence Data using _VariantTools_
+
+Here, I will create a pipeline from reads to lists of genes with variants.
+
+```{r message=FALSE, warning=FALSE}
+# load packages
+library(GenomicRanges)
+library(gmapR)
+library(rtracklayer)
+library(VariantAnnotation)
+library(VariantTools)
+```
+
+```{r message=FALSE, warning=FALSE}
+# load the datasets
+bam_folder <- file.path(getwd())
+bam_folder_contents <- list.files(file.path(getwd()))
+bam <- file.path(bam_folder, "hg17_snps.bam")
+fasta_file <- file.path(bam_folder,"chr17.83k.fa")
+```
+
+```{r message=FALSE, warning=FALSE}
+# set up the genome object
+fa <- rtracklayer::FastaFile(fasta_file)
+genome <- gmapR::GmapGenome(fa, create=TRUE)
+```
+
+```{r}
+# set up the parameter objects
+var_params <- VariantCallingFilters(read.count = 19,
+                                    p.lower = 0.01)
+qual_params <- TallyVariantsParam(genome = genome,
+                                  minimum_mapq = 20)
+```
+
+```{r}
+# call the variants
+called_variants <- callVariants(bam, qual_params,
+                                calling.filters = var_params)
+head(called_variants)
+```
+
+```{r}
+# functions to read annotation from files
+get_annotated_regions <- function(file_name){
+  gff <- import.gff(file_name)
+  as(gff, "GRanges")
+}
+
+get_annotated_regions2 <- function(file_name){
+  bed <- import.bed(file_name)
+  as(bed, "GRanges")
+}
+```
+
+```{r}
+# get annotations
+genes <- get_annotated_regions("chr17.83k.gff3")
+```
+
+```{r}
+# calculate overlapping variants
+overlaps <- findOverlaps(called_variants, genes)
+overlaps
+```
+```{r}
+# as a list
+genes[subjectHits(overlaps)]
+```
+
+# Predicting ORF in Long Reference Sequences
+
+Here, I will be predicting open reading frames using _systemPipeR_.
+
+```{r}
+# load the libraries
+library(Biostrings)
+library(systemPipeR)
+```
+
+```{r}
+# input genome
+dna_object <- readDNAStringSet("arabidopsis_chloroplast.fa")
+```
+
+```{r}
+# predict Open Reading Frames (ORF)
+predicted_orfs <- predORF(dna_object,
+                          n = "all",
+                          type = "gr",
+                          mode = "ORF",
+                          strand = "both",
+                          longest_disjoint = TRUE)
+predicted_orfs
+```
+
+GRanges object returened 2501 ORFs, thus, next step is to filter out some ORFs that occured by chance from the sequence.
+
+```{r}
+# calculate the properties of the reference genome
+bases <- c("A", "C", "G", "T")
+raw_seq_string <- strsplit(as.character(dna_object), "")
+seqlength <- width(dna_object[1])
+counts <- lapply(bases, function(x){sum(grepl(x, raw_seq_string))})
+probs <- unlist(lapply(counts, function(base_count){signif(base_count / seqlength, 2)}))
+```
+
+```{r}
+# find the longest ORF in a simulated genome
+get_longest_orf <- function(x,
+                            length = 1000,
+                            probs = c(0.25, 0.25, 0.25, 0.25),
+                            bases = c("A", "C", "G", "T")) {
+  random_genome <- paste0(sample(bases,
+                                 size = length,
+                                 replace = TRUE,
+                                 prob = probs), collapse = "")
+  random_dna_object <- DNAStringSet(random_genome)
+  names(random_dna_object) <- c("random_dna_string")
+  orfs <- predORF(random_dna_object,
+                  n = 1,
+                  type = "gr",
+                  mode = "ORF",
+                  strand = "both",
+                  longest_disjoint = TRUE)
+  return(max(width(orfs)))
+                            }
+```
+
+```{r}
+# run the function on 10 simulated genomes
+random_lenghts <- unlist(lapply(1:10,
+                                get_longest_orf,
+                                length = seqlength,
+                                probs = probs,
+                                bases = bases))
+```
+
+```{r}
+# find the longest random ORF
+longest_random_orf <- max(random_lenghts)
+
+# keep only predicted ORFs longer than the longest random ORF
+keep <- width(predicted_orfs) > longest_random_orf
+orfs_to_keep <- predicted_orfs[keep]
+head(orfs_to_keep)
+```
+
+```{r}
+# save the ORFs
+extracted_orfs <- getSeq(dna_object, orfs_to_keep)
+names(extracted_orfs) <- paste0("orf_", 1:length(orfs_to_keep))
+writeXStringSet(extracted_orfs, "saved_orfs.fa")
+```
+
+# Plotting Features on Genetic Maps with karyoploteR
+
+Here, I will create some visualisations for chromosomes and ideograms using _karyoploteR_ package.
+
+```{r message=FALSE, warning=FALSE}
+# load packages
+library(karyoploteR)
+library(GenomicRanges)
+```
+
+```{r}
+# set up the genome object
+genome_df <- data.frame(
+  chr = paste0("chr", 1:5),
+  start = rep(1, 5),
+  end = c(34964571, 22037565, 25499034, 20862711, 31270811)
+)
+genome_gr <- makeGRangesFromDataFrame(genome_df)
+```
+
+```{r}
+# set up the SNP positions
+snp_pos <- sample(1:1e7, 25)
+snps <- data.frame(
+  chr = paste0("chr", sample(1:5, 25, replace = TRUE)),
+  start = snp_pos,
+  end = snp_pos
+)
+snps_gr <- makeGRangesFromDataFrame(snps)
+```
+
+```{r}
+# create labels
+snp_labels <- paste0("snp_", 1:25)
+
+# set the plot margins
+plot.params <- getDefaultPlotParams(plot.type = 1)
+plot.params$data1outmargin <- 600
+```
+
+```{r}
+# create the base plot and add tracks
+kp <- plotKaryotype(genome = genome_gr,
+                    plot.type = 1,
+                    plot.params = plot.params)
+kpPlotMarkers(kp, snps_gr, labels = snp_labels)
+```
+
+# Selecting and Classifying Variants with _VariantAnnotation_
+
+Using a VCF file, I will do subsequent analyses that need further filtering and classification based on features of the individual variants like the depth coverage in the alternative allele.
+
+```{r message=FALSE, warning=FALSE}
+# load packages
+library(VariantAnnotation)
+```
+
+```{r}
+# create a prefilter function
+is_not_microsat <- function(x){
+  !grepl("microsat", x, fixed = TRUE)
+}
+```
+
+```{r}
+# load up the prefilter function into a FilterRules object
+prefilters <- FilterRules(list(microsat = is_not_microsat))
+```
+
+```{r}
+# create a filter function to keep variants where the reference allele is in less than half the reads
+major_alt <- function(x){
+  af <- info(x)$AF
+  result <- unlist(lapply(af, function(x){
+    x[1] < 0.5
+  }))
+  return(result)
+}
+```
+
+```{r}
+# load the filter function into a FilterRules object
+filters <- FilterRules(list(alt_is_major = major_alt))
+```
+
+```{r}
+# load the input VCF file and apply filters
+vcf_file <- "sample.vcf.gz"
+filterVcf(vcf_file, 
+          "hg17", 
+          "filtered.vcf",
+          prefilters = prefilters,
+          filters = filters)
+```
+
+# Extracting Information in Genomic Regions of Interest
+
+Here, I will look in more detail at data that falls in a particular genomic region of interest, whether that be the SNPs and variants in a gene or the genes in a particular locus.
+
+```{r}
+# load packages
+library(GenomicRanges)
+library(rtracklayer)
+library(SummarizedExperiment)
+library(readr)
+```
+
+```{r}
+# define functions that read and create GRanges
+# from .GFF
+get_granges_gff <- function(file_name){
+  gff <- import.gff(file_name)
+  as(gff, "GRanges")
+}
+
+# from .BED
+get_granges_bed <- function(file_name){
+  bed <- import.bed(file_name)
+  as(bed, "GRanges")
+}
+
+# from .TXT
+get_granges_txt <- function(file_name){
+  df <- read_tsv(file_name, col_names = TRUE)
+  makeGRangesFromDataFrame(df, keep.extra.columns = TRUE)
+}
+```
+
+```{r}
+# create GRanges objects
+gr_from_gff <- get_granges_gff("arabidopsis_chr4.gff")
+gr_from_txt <- get_granges_txt("arabidopsis_chr4.txt")
+```
+
+```{r}
+# extract a region by filtering on attributes
+genes_on_chr4 <- gr_from_gff[gr_from_gff$type == "gene" & seqnames(gr_from_gff) %in% c("Chr4")]
+```
+
+```{r}
+# manually create a region of interest
+region_of_interest_gr <- GRanges(
+  seqnames = c("Chr4"),
+  IRanges(c(10000), width = c(1000))
+)
+```
+
+```{r}
+# Use the region of interest to subset the larger object
+overlap_hits <- findOverlaps(region_of_interest_gr,
+                             gr_from_gff)
+features_in_region <- gr_from_gff[subjectHits(overlap_hits)]
+head(features_in_region)
+```
+
+# Finding Phenotype and Genotype Associations with _GWAS_
+
+To find genetic variants in many samples, I will use **genome-wide association studies** method.
+
+```{r}
+# load packages
+library(VariantAnnotation)
+library(rrBLUP)
+```
+
+```{r}
+# get the VCF file
+set.seed(1234)
+vcf_file <- "small_sample.vcf"
+vcf <- readVcf(vcf_file, "hg19")
+```
+
+```{r}
+# extract the genotype, sample and marker position
+gts <- geno(vcf)$GT
+samples <- samples(header(vcf))
+markers <- rownames(gts)
+chrom <- as.character(seqnames(rowRanges(vcf)))
+pos <- as.numeric(start(rowRanges(vcf)))
+```
+
+```{r}
+# create a custom function to convert VCF genotypes into the convention used by the GWAS function
+# 0/0 means homozygous in VCF file which corresponds to 1 in GWAS function
+convert <- function(v){
+  v <- gsub("0/0", 1, v)
+  v <- gsub("0/1", 0, v)
+  v <- gsub("1/0", 0, v)
+  v <- gsub("1/1", -1, v)
+  return(v)
+}
+```
+
+```{r}
+# call the function and convert result into a numeric matrix
+gt_char <- apply(gts, convert, MARGIN = 2)
+genotype_matrix <- matrix(as.numeric(gt_char),
+                          nrow(gt_char))
+colnames(genotype_matrix) <- samples
+```
+
+```{r}
+# build a dataframe describing the variant
+variant_info <- data.frame(marker = markers,
+                           chrom = chrom,
+                           pos = pos)
+
+#build a combined variant/genotype dataframe
+genotypes <- cbind(variant_info,
+                   as.data.frame(genotype_matrix))
+head(genotypes)
+```
+
+```{r}
+# build a phenotype dataframe
+phenotypes <- data.frame(
+  line = samples,
+  score = rnorm(length(samples))
+)
+head(phenotypes)
+```
+
+```{r}
+# run GWAS
+GWAS(phenotypes, genotypes, plot = FALSE)
+```
+
+# Estimating the Copy Number at a Locus of Interest
+
+It is often of interest to know how often a sequence occurs in a sample of interest—that is, to estimate whether a locus has been duplicated or its copy number has increased.
+
+```{r}
+# load packages
+library(csaw)
+library(SummarizedExperiment)
+```
+
+```{r}
+# get counts across the genome
+whole_genome <- windowCounts("hg17_snps.bam",
+                             bin = TRUE,
+                             filter = 0,
+                             width = 100,
+                             param = readParam(minq = 20,
+                                               dedup = TRUE,
+                                               pe = "both"))
+colnames(whole_genome) <- c("h17")
+```
+
+```{r}
+# extract data
+counts <- assay(whole_genome)[, 1]
+```
+
+```{r}
+# set a low count threshold and set lowers to NA
+min_count <- quantile(counts, 0.1)[[1]]
+counts[counts <- min_count] <- NA
+```
+
+```{r}
+# double the counts of a set of windows
+n <- length(counts)
+doubled_windows <- 10
+
+left_pad <- floor((n/2) - doubled_windows)
+right_pad <- (n - left_pad - doubled_windows)
+multiplier <- c(rep(1, left_pad),
+                rep(2, doubled_windows),
+                rep(1, right_pad))
+
+counts <- counts * multiplier
+```
+
+```{r}
+# calculate the mean coverage anad the ratio in each window
+mean_cov <- mean(counts, na.rm = TRUE)
+ratio <- matrix(log2(counts / mean_cov), ncol = 1)
+plot(ratio)
+```
+
+```{r}
+# build summarisedexperiment with new data
+se <- SummarizedExperiment(assays = list(ratio),
+                           rowRanges = rowRanges(whole_genome),
+                           colData = c("CoverageRatio"))
+```
+
+```{r}
+# create a region of interest and extract coverage data
+region_of_interest <- GRanges(
+  seqnames = c("NC_000017.10"),
+  IRanges(c(40700), width = c(1500))
+)
+overlap_hits <- findOverlaps(region_of_interest, se)
+data_in_region <- se[subjectHits(overlap_hits)]
+assay(data_in_region)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r session info}
+sessionInfo()
+```
